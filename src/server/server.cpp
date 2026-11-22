@@ -629,7 +629,7 @@ void HttpSession::send_chunk_data(const json& data, bool is_final) {
 
 ///@brief WebServer implementation
 ///@param port the port
-WebServer::WebServer(std::string host, int port, bool cors) : acceptor(ioc, {net::ip::make_address(host), static_cast<unsigned short>(port)}), running(false), port(port), cors(cors) {
+WebServer::WebServer(std::string host, int port, bool cors) : acceptor(ioc, {net::ip::make_address(host), static_cast<unsigned short>(port)}), idle_timer_(ioc), running(false), port(port), cors(cors) {
     origin_policy_.cors = cors;
     // On a loopback bind a request must also name a local Host (DNS rebinding); a server bound
     // to 0.0.0.0 or a LAN address is reached by names this process cannot know.
@@ -647,6 +647,7 @@ WebServer::~WebServer() {
 void WebServer::start() {
     running = true;
     do_accept();
+    schedule_idle_timer();
     
     // Run the I/O service on multiple threads for better concurrency
     for (size_t i = 0; i < io_thread_count_; ++i) {
@@ -673,6 +674,7 @@ void WebServer::start() {
 ///@brief stop
 void WebServer::stop() {
     running = false;
+    idle_timer_.cancel();
     ioc.stop();
     
     // Wait for all I/O threads to finish
@@ -682,6 +684,37 @@ void WebServer::stop() {
         }
     }
     io_threads_.clear();
+}
+
+void WebServer::set_idle_callback(std::chrono::seconds interval, std::function<bool()> should_run, std::function<void()> callback) {
+    idle_check_interval_ = interval;
+    should_run_idle_check_ = std::move(should_run);
+    on_idle_check_ = std::move(callback);
+}
+
+void WebServer::schedule_idle_timer() {
+    if (!running || !on_idle_check_ || idle_check_interval_.count() <= 0) return;
+    idle_timer_.expires_after(idle_check_interval_);
+    idle_timer_.async_wait([this](const boost::system::error_code& ec) {
+        if (ec || !running) return;
+        const bool due = !should_run_idle_check_ || should_run_idle_check_();
+        if (due && npu_request_coordinator_.try_acquire_when_idle([] { return AcceleratorAccessManager::try_acquire_npu_access(); })) {
+            AcceleratorRequestCompletionGuard guard([this]() {
+                npu_request_coordinator_.complete_current(
+                    [this](AcceleratorRequestCoordinator::Task next) { net::post(ioc, std::move(next)); },
+                    [] { AcceleratorAccessManager::release_npu_access(); },
+                    std::chrono::milliseconds(0));
+            });
+            try {
+                if (on_idle_check_) on_idle_check_();
+            } catch (const std::exception& e) {
+                header_print("LOG", "Error in idle maintenance callback: " + std::string(e.what()));
+            } catch (...) {
+                header_print("LOG", "Unknown error in idle maintenance callback");
+            }
+        }
+        schedule_idle_timer();
+    });
 }
 
 ///@brief register active request
@@ -1033,6 +1066,12 @@ std::unique_ptr<WebServer> create_lm_server(model_list& models, ModelDownloader&
     auto server = std::make_unique<WebServer>(args.host, args.port, args.cors);
     server->set_cors_origins(args.cors_origins);
     auto rest_handler = std::make_shared<RestHandler>(models, downloader, args, npu_device);
+    if (args.idle_unload_seconds > 0) {
+        server->set_idle_callback(
+            std::chrono::seconds(1),
+            [rest_handler]() { return rest_handler->is_idle_unload_due(); },
+            [rest_handler]() { rest_handler->unload_if_idle(); });
+    }
     
     // Register Ollama-compatible routes
     server->register_handler("POST", "/api/show",

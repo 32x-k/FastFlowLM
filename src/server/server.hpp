@@ -85,6 +85,12 @@ public:
         tasks_.push(std::move(task));
         return Admission::queued;
     }
+    /// \brief Acquire the accelerator only when no tasks are waiting in the queue.
+    bool try_acquire_when_idle(const std::function<bool()>& try_acquire) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!tasks_.empty()) return false;
+        return try_acquire();
+    }
     Task take_next() {
         std::lock_guard<std::mutex> lock(mutex_);
         if (tasks_.empty()) return {};
@@ -215,6 +221,7 @@ public:
     void set_request_timeout(std::chrono::seconds timeout) { request_timeout_ = timeout; }
     void set_io_threads(size_t num_threads) { io_thread_count_ = num_threads; }
     void set_npu_queue_length(size_t q_len) { npu_request_coordinator_.set_capacity(q_len); }
+    void set_idle_callback(std::chrono::seconds interval, std::function<bool()> should_run, std::function<void()> callback);
     // Maximum accepted HTTP request body size (in bytes)
     void set_max_body_size_bytes(std::size_t bytes) { max_body_size_bytes_ = bytes; }
     /// --cors-origins: comma-separated origins allowed besides the local ones; "*" allows all.
@@ -245,10 +252,15 @@ private:
     ///@brief do accept
     void do_accept();
     void process_next_npu_request();
+    void schedule_idle_timer();
     ///@brief io context
     net::io_context ioc;
     ///@brief acceptor
     tcp::acceptor acceptor;
+    net::steady_timer idle_timer_;
+    std::chrono::seconds idle_check_interval_{0};
+    std::function<bool()> should_run_idle_check_;
+    std::function<void()> on_idle_check_;
     ///@brief routes
     std::map<std::string, RequestHandler> routes;
     ///@brief running

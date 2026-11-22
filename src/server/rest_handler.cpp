@@ -688,6 +688,8 @@ RestHandler::RestHandler(model_list& models, ModelDownloader& downloader, progra
     this->prefix_cache_mb = args.prefix_cache_mb;
     this->prefix_slots = args.prefix_slots;
     this->prefix_min_gain = args.prefix_min_gain;
+    this->idle_unload_seconds = args.idle_unload_seconds;
+    this->touch_activity();
     this->raw_rgb8_limits.allow_path_dir = args.raw_path_dir;
     if (!args.raw_path_dir.empty()) {
         std::error_code raw_dir_ec;
@@ -739,6 +741,42 @@ RestHandler::RestHandler(model_list& models, ModelDownloader& downloader, progra
 ///@brief RestHandler destructor
 ///@return the rest handler
 RestHandler::~RestHandler() = default;
+
+void RestHandler::touch_activity() {
+    const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    last_activity_ms_.store(now_ms, std::memory_order_relaxed);
+}
+
+std::string RestHandler::effective_default_model() const {
+    if (current_model_tag != "model-faker") return current_model_tag;
+    return default_model_tag;
+}
+
+bool RestHandler::is_idle_unload_due() const {
+    if (idle_unload_seconds <= 0 || !has_loaded_model_.load(std::memory_order_relaxed)) return false;
+    const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    const int64_t idle_ms = now_ms - last_activity_ms_.load(std::memory_order_relaxed);
+    return idle_ms >= static_cast<int64_t>(idle_unload_seconds) * 1000;
+}
+
+void RestHandler::unload_if_idle() {
+    if (!is_idle_unload_due() || !auto_chat_engine) return;
+
+    std::string unloaded_tag;
+    {
+        std::lock_guard lock(model_info_mutex);
+        unloaded_tag = current_model_tag;
+        current_model_tag = "model-faker";
+        loaded_backend.clear();
+    }
+    has_loaded_model_.store(false, std::memory_order_relaxed);
+    auto_chat_engine.reset();
+    prompt_cache.reset();
+    loaded_selection = {};
+    header_print("FLM", "Idle timeout reached (" << idle_unload_seconds << "s); unloaded model '" << unloaded_tag << "' from NPU/RAM.");
+}
 
 ///@brief Ensure the model is loaded
 ///@param model_tag the model tag
@@ -792,6 +830,7 @@ bool RestHandler::ensure_model_loaded(const std::string& model_tag,
             current_model_tag = "model-faker";
             loaded_backend.clear();
         }
+        has_loaded_model_.store(false, std::memory_order_relaxed);
         auto_chat_engine.reset();
         prompt_cache.reset();
         auto engine = flm::frontend::FrontendRegistry::instance().create(plan.family, device);
@@ -812,6 +851,8 @@ bool RestHandler::ensure_model_loaded(const std::string& model_tag,
         }
         auto_chat_engine = std::move(engine);
         loaded_selection = std::move(plan.selection);
+        has_loaded_model_.store(true, std::memory_order_relaxed);
+        touch_activity();
         return true;
     } catch (const flm::backend::NpuUnavailable& e) {
         if (refusal) *refusal = flm::backend::kNoNpuDevice;
@@ -1140,7 +1181,12 @@ void RestHandler::handle_generate(const json& request,
         }
         std::string prompt = request.at("prompt").get<std::string>();
         bool stream = request.value("stream", true);
-        std::string model = request.value("model", current_model_tag);
+        std::string model = request.value("model", effective_default_model());
+        struct ActivityGuard {
+            RestHandler* self;
+            ActivityGuard(RestHandler* s) : self(s) { self->touch_activity(); }
+            ~ActivityGuard() { self->touch_activity(); }
+        } activity_guard(this);
         const std::string request_backend = request.value("backend", std::string());
         json options = request.value("options", json::object());
        
@@ -1271,7 +1317,12 @@ void RestHandler::handle_chat(const json& request,
         }
         nlohmann::ordered_json messages = request.at("messages");
         bool stream = request.value("stream", false);
-        std::string model = request.value("model", current_model_tag);
+        std::string model = request.value("model", effective_default_model());
+        struct ActivityGuard {
+            RestHandler* self;
+            ActivityGuard(RestHandler* s) : self(s) { self->touch_activity(); }
+            ~ActivityGuard() { self->touch_activity(); }
+        } activity_guard(this);
         const std::string request_backend = request.value("backend", std::string());
         json options = request.value("options", json::object());
         int length_limit = options.value("num_predict", 4096);
@@ -1480,6 +1531,10 @@ void RestHandler::handle_ps(const json& request,
             tag = current_model_tag;
             backend_id = loaded_backend;
         }
+        if (tag == "model-faker" || tag.empty()) {
+            send_response(json{{"models", json::array()}});
+            return;
+        }
         auto info = supported_models.get_model_info(tag).second;
         auto& details = info["details"];
         if (!backend_id.empty()) {
@@ -1577,7 +1632,12 @@ void RestHandler::handle_openai_chat_completion(const json& request,
             return;
         }
         json current_messages = request.at("messages");
-        std::string model = value_or(request, "model", current_model_tag);
+        std::string model = value_or(request, "model", effective_default_model());
+        struct ActivityGuard {
+            RestHandler* self;
+            ActivityGuard(RestHandler* s) : self(s) { self->touch_activity(); }
+            ~ActivityGuard() { self->touch_activity(); }
+        } activity_guard(this);
         const std::string request_backend = value_or(request, "backend", std::string());
         bool stream = value_or(request, "stream", false);
         int length_limit = value_or(request, "max_tokens", value_or(request, "max_completion_tokens", 4096));
@@ -2132,10 +2192,35 @@ void RestHandler::handle_openai_completion(const json& request,
             return;
         }
         std::string prompt = request.at("prompt");
-        std::string model = value_or(request, "model", current_model_tag);
+        std::string model = value_or(request, "model", effective_default_model());
+        struct ActivityGuard {
+            RestHandler* self;
+            ActivityGuard(RestHandler* s) : self(s) { self->touch_activity(); }
+            ~ActivityGuard() { self->touch_activity(); }
+        } activity_guard(this);
         const std::string request_backend = value_or(request, "backend", std::string());
         bool stream = value_or(request, "stream", false);
         json options = value_or(request, "options", json::object());
+        std::vector<std::string> stop_sequences;
+        if (has_value(request, "stop")) {
+            const auto& stop_val = request.at("stop");
+            if (stop_val.is_string()) {
+                const auto s = stop_val.get<std::string>();
+                if (!s.empty()) stop_sequences.push_back(s);
+            } else if (stop_val.is_array()) {
+                for (const auto& item : stop_val) {
+                    if (!item.is_string()) {
+                        send_response({{"error", {{"message", "'stop' array entries must be strings"}, {"type", "invalid_request_error"}, {"code", 400}}}});
+                        return;
+                    }
+                    const auto s = item.get<std::string>();
+                    if (!s.empty()) stop_sequences.push_back(s);
+                }
+            } else {
+                send_response({{"error", {{"message", "'stop' must be a string or an array of strings"}, {"type", "invalid_request_error"}, {"code", 400}}}});
+                return;
+            }
+        }
         openai_sampling_request sampling;
         std::string request_error;
         if (!sampling_request_from_openai(request, sampling, request_error)) {
@@ -2178,12 +2263,18 @@ void RestHandler::handle_openai_completion(const json& request,
         if (stream) {
             // Create a wrapper callback that passes the pre-formatted SSE string directly
             bool stream_started = false;
+            std::atomic<bool> stop_triggered{false};
             auto openai_stream_callback = [&send_streaming_response, &stream_started](const std::string& data, bool is_final) {
                 stream_started = true;
                 json data_json = data;
                 send_streaming_response(data_json, is_final);
                 };
-            streaming_ostream_openai ostream(model, openai_stream_callback, stream_include_usage(request));  // streaming in completion format
+            streaming_ostream_openai ostream(
+                model,
+                openai_stream_callback,
+                stream_include_usage(request),
+                stop_sequences,
+                [&stop_triggered]() { stop_triggered.store(true, std::memory_order_relaxed); });  // streaming in completion format
             // Once a chunk is out the headers are sent, so an error can only go
             // out as one more event, and the stream still has to be ended or the
             // client waits on it until its own timeout
@@ -2216,7 +2307,9 @@ void RestHandler::handle_openai_completion(const json& request,
                 return;
             }
             try {
-                auto_chat_engine->generate(meta_info, length_limit, ostream, [&] { return cancellation_token && cancellation_token->cancelled(); });
+                auto_chat_engine->generate(meta_info, length_limit, ostream, [&] {
+                    return stop_triggered.load(std::memory_order_relaxed) || (cancellation_token && cancellation_token->cancelled());
+                });
             } catch (const ModelRequestError& error) {
                 send_stream_error(ModelErrorResponse(error));
                 return;
@@ -2236,8 +2329,42 @@ void RestHandler::handle_openai_completion(const json& request,
             this->auto_chat_engine->clear_context();
         }
         else {
-            std::stringstream ss;
-            wstream_buf obuf(ss);
+            std::atomic<bool> stop_triggered{false};
+            class StopCheckingBuf : public std::streambuf {
+            public:
+                StopCheckingBuf(std::string& out, const std::vector<std::string>& stops, std::atomic<bool>& triggered)
+                    : out_(out), stops_(stops), triggered_(triggered) {}
+            protected:
+                int_type overflow(int_type ch) override {
+                    if (!stopped_ && ch != traits_type::eof()) {
+                        out_.push_back(static_cast<char>(ch));
+                    }
+                    return ch;
+                }
+                int sync() override {
+                    if (stopped_ || stops_.empty()) return 0;
+                    size_t earliest = std::string::npos;
+                    for (const auto& s : stops_) {
+                        const size_t pos = out_.find(s);
+                        if (pos != std::string::npos && (earliest == std::string::npos || pos < earliest)) {
+                            earliest = pos;
+                        }
+                    }
+                    if (earliest != std::string::npos) {
+                        out_.erase(earliest);
+                        stopped_ = true;
+                        triggered_.store(true, std::memory_order_relaxed);
+                    }
+                    return 0;
+                }
+            private:
+                std::string& out_;
+                const std::vector<std::string>& stops_;
+                std::atomic<bool>& triggered_;
+                bool stopped_ = false;
+            };
+            std::string response_text;
+            StopCheckingBuf obuf(response_text, stop_sequences, stop_triggered);
             std::ostream ostream(&obuf);
             uniformed_input.prompt = prompt;
             try {
@@ -2260,15 +2387,19 @@ void RestHandler::handle_openai_completion(const json& request,
                 return;
             }
             try {
-                auto_chat_engine->generate(meta_info, length_limit, ostream, [&] { return cancellation_token && cancellation_token->cancelled(); });
+                auto_chat_engine->generate(meta_info, length_limit, ostream, [&] {
+                    return stop_triggered.load(std::memory_order_relaxed) || (cancellation_token && cancellation_token->cancelled());
+                });
             } catch (const std::exception& e) {
                 json error_response = OpenAIExceptionResponse(e);
                 send_response(error_response);
                 this->auto_chat_engine->clear_context();
                 return;
             }
-            std::string response_text = ss.str();
-            auto history = this->auto_chat_engine->get_history();
+            ostream.flush();
+            if (stop_triggered.load(std::memory_order_relaxed) && meta_info.stop_reason == stop_reason_t::CANCEL_DETECTED) {
+                meta_info.stop_reason = stop_reason_t::EOT_DETECTED;
+            }
 
             json response = {
                 {"id", "fastflowlm-chat-completion"},
@@ -2292,6 +2423,7 @@ void RestHandler::handle_openai_completion(const json& request,
             };
             if (meta_info.prefix_cache.valid) response["usage"]["flm_prefix_cache"] = prefix_cache_usage_json(meta_info.prefix_cache);
             log_request_summary(meta_info, this->auto_chat_engine->get_current_context_length(), this->auto_chat_engine->get_max_length());
+            this->auto_chat_engine->clear_context();
             send_response(response);
         }
     }

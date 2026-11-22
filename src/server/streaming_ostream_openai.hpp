@@ -43,20 +43,33 @@ public:
     ///@param model the model name reported to the client
     ///@param callback receives each server-sent event
     ///@param include_usage stream_options.include_usage: send usage in its own chunk before [DONE]
-    streaming_buf_openai(const std::string& model, StreamCallback callback, bool include_usage)
-        : model_name(model), stream_callback(callback), include_usage(include_usage), first_chunk(true) {
+    ///@param stop_sequences optional OpenAI stop strings; generation stops as soon as any appears
+    ///@param on_stop invoked once when a stop sequence is matched
+    streaming_buf_openai(const std::string& model, StreamCallback callback, bool include_usage,
+                         std::vector<std::string> stop_sequences = {},
+                         std::function<void()> on_stop = nullptr)
+        : model_name(model), stream_callback(callback), include_usage(include_usage), first_chunk(true),
+          on_stop_(std::move(on_stop)) {
+        for (auto& s : stop_sequences) {
+            if (!s.empty()) {
+                if (s.size() > max_stop_len_) max_stop_len_ = s.size();
+                stop_sequences_.push_back(std::move(s));
+            }
+        }
         // Generate a unique ID for this stream
         generate_stream_id();
         generate_created();
         generate_system_fingerprint();
     }
 
+    bool stopped_by_sequence() const { return stopped_; }
+
 protected:
     ///@brief Called when buffer is full or flush is requested
     ///@param ch the character
     ///@return the character
     int_type overflow(int_type ch) override {
-        if (ch != traits_type::eof()) {
+        if (!stopped_ && ch != traits_type::eof()) {
             buffer += static_cast<char>(ch);
         }
         return ch;
@@ -65,19 +78,51 @@ protected:
     ///@brief Called when stream is flushed
     ///@return 0
     int sync() override {
-        flush_complete_utf8_sequences(false);
+        if (stopped_) {
+            buffer.clear();
+            return 0;
+        }
+        if (stop_sequences_.empty()) {
+            flush_complete_utf8_prefix(buffer.size(), false);
+            return 0;
+        }
+        const size_t match = find_earliest_stop(buffer);
+        if (match != std::string::npos) {
+            flush_complete_utf8_prefix(match, false);
+            buffer.clear();
+            stopped_ = true;
+            if (on_stop_) on_stop_();
+            return 0;
+        }
+        const size_t hold = partial_stop_suffix_len(buffer);
+        const size_t safe_end = buffer.size() - hold;
+        if (safe_end > 0) {
+            flush_complete_utf8_prefix(safe_end, false);
+        }
         return 0;
     }
 
 public:
     ///@brief Call this when generation is complete
     void finalize(chat_meta_info_t& meta_info) {
-        // Send the remaining content but not an incomplete UTF-8 sequence at
-        // its end: a generation cut off by the length limit or a cancel can
-        // stop partway through a multi-byte character, the missing bytes will
-        // never come, and invalid UTF-8 makes json::dump() throw
-        flush_complete_utf8_sequences(false);
+        if (!stopped_) {
+            if (!stop_sequences_.empty()) {
+                const size_t match = find_earliest_stop(buffer);
+                if (match != std::string::npos) {
+                    buffer.erase(match);
+                    stopped_ = true;
+                }
+            }
+            // Send the remaining content but not an incomplete UTF-8 sequence at
+            // its end: a generation cut off by the length limit or a cancel can
+            // stop partway through a multi-byte character, the missing bytes will
+            // never come, and invalid UTF-8 makes json::dump() throw
+            flush_complete_utf8_prefix(buffer.size(), false);
+        }
         buffer.clear();
+        if (stopped_ && meta_info.stop_reason == stop_reason_t::CANCEL_DETECTED) {
+            meta_info.stop_reason = stop_reason_t::EOT_DETECTED;
+        }
         send_final_response(meta_info);
     }
  
@@ -114,17 +159,44 @@ private:
         system_fingerprint = ss.str();
     }
 
-    ///@brief Flush only complete UTF-8 sequences
+    size_t find_earliest_stop(const std::string& text) const {
+        size_t earliest = std::string::npos;
+        for (const auto& stop : stop_sequences_) {
+            const size_t pos = text.find(stop);
+            if (pos != std::string::npos && (earliest == std::string::npos || pos < earliest)) {
+                earliest = pos;
+            }
+        }
+        return earliest;
+    }
+
+    size_t partial_stop_suffix_len(const std::string& text) const {
+        if (max_stop_len_ <= 1 || text.empty()) return 0;
+        const size_t max_check = std::min(text.size(), max_stop_len_ - 1);
+        for (size_t len = max_check; len >= 1; --len) {
+            const size_t start = text.size() - len;
+            for (const auto& stop : stop_sequences_) {
+                if (stop.size() > len && text.compare(start, len, stop, 0, len) == 0) {
+                    return len;
+                }
+            }
+        }
+        return 0;
+    }
+
+    ///@brief Flush only complete UTF-8 sequences within buffer[0..limit)
+    ///@param limit max bytes from the start of buffer eligible to flush
     ///@param is_final the is final
-    void flush_complete_utf8_sequences(bool is_final) {
-        if (buffer.empty()) return;
+    void flush_complete_utf8_prefix(size_t limit, bool is_final) {
+        if (buffer.empty() || limit == 0) return;
+        const size_t bound = std::min(limit, buffer.size());
         
         std::string complete_content;
         size_t pos = 0;
         
         // Process complete UTF-8 sequences
-        while (pos < buffer.size()) {
-            const int len = utf8_char_len(reinterpret_cast<const unsigned char*>(buffer.data()) + pos, buffer.size() - pos);
+        while (pos < bound) {
+            const int len = utf8_char_len(reinterpret_cast<const unsigned char*>(buffer.data()) + pos, bound - pos);
             if (len == 0) {
                 // Not part of a well-formed character (e.g. a character's first byte followed by
                 // another token): skip it, json::dump() would throw on it
@@ -241,6 +313,10 @@ private:
     std::string system_fingerprint;
     ///@brief First chunk flag
     bool first_chunk;
+    std::vector<std::string> stop_sequences_;
+    size_t max_stop_len_ = 0;
+    std::function<void()> on_stop_;
+    bool stopped_ = false;
 };
 
 ///@brief Custom ostream for streaming
@@ -250,12 +326,18 @@ private:
 ///@return the streaming ostream
 class streaming_ostream_openai : public std::ostream {
 public:
-    streaming_ostream_openai(const std::string& model, streaming_buf_openai::StreamCallback callback, bool include_usage)
-        : std::ostream(&buf), buf(model, callback, include_usage) {}
+    streaming_ostream_openai(const std::string& model, streaming_buf_openai::StreamCallback callback, bool include_usage,
+                             std::vector<std::string> stop_sequences = {},
+                             std::function<void()> on_stop = nullptr)
+        : std::ostream(&buf), buf(model, callback, include_usage, std::move(stop_sequences), std::move(on_stop)) {}
     
     ///@brief Finalize the chat
     void finalize(chat_meta_info_t& meta_info) {
         buf.finalize(meta_info);
+    }
+
+    bool stopped_by_sequence() const {
+        return buf.stopped_by_sequence();
     }
 
 private:

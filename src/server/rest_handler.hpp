@@ -9,6 +9,8 @@
 #pragma once
 #include <optional>
 #include <mutex>
+#include <atomic>
+#include <cstdint>
 
 #include "AutoModel/all_models.hpp"
 #ifndef FASTFLOWLM_LINUX_LIMITED_MODELS
@@ -123,7 +125,16 @@ public:
         StreamResponseCallback send_streaming_response,
         std::shared_ptr<CancellationToken> cancellation_token = nullptr);
 
+    /// Fast lock-free check for whether the loaded chat model has exceeded --idle-unload.
+    bool is_idle_unload_due() const;
+
+    /// Unload the chat model if inactivity has exceeded --idle-unload.
+    /// Caller must hold the accelerator lock (via WebServer idle maintenance).
+    void unload_if_idle();
+
 private:
+    void touch_activity();
+    std::string effective_default_model() const;
     bool ensure_model_loaded(const std::string& model_tag,
                              const std::string& request_backend = "", std::string* refusal = nullptr);
     bool is_known_model(const std::string& model_tag);
@@ -179,4 +190,7 @@ private:
     flm::backend::BackendSelection loaded_selection;
     bool positional_tool_results = false;
     PromptCache prompt_cache;
+    int idle_unload_seconds = 0;
+    std::atomic<int64_t> last_activity_ms_{0};
+    std::atomic<bool> has_loaded_model_{false};
 };

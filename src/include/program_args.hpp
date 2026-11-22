@@ -57,6 +57,8 @@ struct program_args_t {
     bool cors = true;  // same default as the --cors option
     // --cors-origins: origins allowed besides the local ones (comma-separated; "*" = any)
     std::string cors_origins;
+    // --idle-unload: seconds of inactivity before unloading the chat model (0 = never)
+    int idle_unload_seconds = 0;
     bool sub_process_mode = false;
     
     program_args_t() {}

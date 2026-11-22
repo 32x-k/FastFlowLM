@@ -54,6 +54,7 @@ inline void print_help(po::options_description& general) {
     std::cout << "\tflm serve llama3.2:1b --port 8000" << std::endl;
     std::cout << "\tflm serve llama3.2:1b --cors 0" << std::endl;
     std::cout << "\tflm serve llama3.2:1b --cors-origins \"http://nas:3000\"" << std::endl;
+    std::cout << "\tflm serve llama3.2:1b --idle-unload 300" << std::endl;
     std::cout << "\tflm serve llama3.2:1b --asr whisper-v3:turbo" << std::endl;
     std::cout << "\tflm serve llama3.2:1b --embed embed-gemma:300m" << std::endl;
     std::cout << "\tflm serve -a whisper-v3:turbo" << std::endl;
@@ -143,6 +144,8 @@ bool parse_options(int argc, char *argv[], program_args_t& parsed_args) {
              "\"http://nas:3000,https://webui.example.com\"; \"*\" allows every origin (for serve command). "
              "Requests from other origins get 403. The host names listed here are also accepted as "
              "Host on a loopback bind (reverse proxies); \"*\" turns that check off too")
+            ("idle-unload", po::value<int>(&parsed_args.idle_unload_seconds)->default_value(0),
+             "Seconds of inactivity before unloading the chat model from NPU/RAM, 0 = never (for serve command)")
             ("preemption", po::value<bool>(&parsed_args.preemption)->default_value(false),
              "Enable preemption")
             ("prompt,i", po::value<std::string>(&parsed_args.input_file_name)->default_value(""),
@@ -256,6 +259,16 @@ bool parse_options(int argc, char *argv[], program_args_t& parsed_args) {
                 std::cerr << "Error: The cors-origins option is only supported with the serve command! " << std::endl;
                 return false;
             }
+            if (!vm["idle-unload"].defaulted())
+            {
+                std::cerr << "Error: The idle-unload option is only supported with the serve command! " << std::endl;
+                return false;
+            }
+        }
+        if (parsed_args.idle_unload_seconds < 0)
+        {
+            std::cerr << "Error: --idle-unload must be >= 0" << std::endl;
+            return false;
         }
 
         // Handle all options
