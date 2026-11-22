@@ -2427,9 +2427,66 @@ void RestHandler::handle_openai_completion(const json& request,
         // Always ensure the requested model is actually loaded on the NPU before checking
         // the completion LRU cache so switching models via a connection probe or translation
         // request immediately loads the target model.
+        // For streaming requests that require a model switch, send SSE headers immediately
+        // and emit periodic SSE comment heartbeats (": loading\n\n") while weights load so
+        // mobile browsers / proxies never drop the connection on a 30s response-header timeout.
+        bool sse_headers_sent = false;
+        std::atomic<bool> load_heartbeat_done{false};
+        std::thread load_heartbeat_thread;
+        struct LoadHeartbeatGuard {
+            std::atomic<bool>& done;
+            std::thread& worker;
+            ~LoadHeartbeatGuard() {
+                done.store(true, std::memory_order_release);
+                if (worker.joinable()) worker.join();
+            }
+        } load_heartbeat_guard{load_heartbeat_done, load_heartbeat_thread};
+
+        if (stream) {
+            const std::string rectified = supported_models.rectify_model_tag(model);
+            bool already_loaded = false;
+            {
+                std::lock_guard lock(model_info_mutex);
+                already_loaded = auto_chat_engine != nullptr && current_model_tag == rectified;
+            }
+            if (!already_loaded) {
+                sse_headers_sent = true;
+                send_streaming_response(json(": loading\n\n"), false);
+                load_heartbeat_thread = std::thread([&load_heartbeat_done, &send_streaming_response, cancellation_token]() {
+                    for (;;) {
+                        for (int i = 0; i < 50; ++i) { // 5s total in 100ms steps
+                            if (load_heartbeat_done.load(std::memory_order_acquire) ||
+                                (cancellation_token && cancellation_token->cancelled())) {
+                                return;
+                            }
+                            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                        }
+                        if (load_heartbeat_done.load(std::memory_order_acquire) ||
+                            (cancellation_token && cancellation_token->cancelled())) {
+                            return;
+                        }
+                        try {
+                            send_streaming_response(json(": loading\n\n"), false);
+                        } catch (...) {
+                            return;
+                        }
+                    }
+                });
+            }
+        }
+
         std::string refusal;
-        if (!ensure_model_loaded(model, request_backend, &refusal, cancellation_token)) {
-            send_response(ModelLoadFailedResponse(model, refusal));
+        const bool loaded_ok = ensure_model_loaded(model, request_backend, &refusal, cancellation_token);
+        load_heartbeat_done.store(true, std::memory_order_release);
+        if (load_heartbeat_thread.joinable()) load_heartbeat_thread.join();
+
+        if (!loaded_ok) {
+            if (sse_headers_sent) {
+                const json err = ModelLoadFailedResponse(model, refusal);
+                send_streaming_response(json("data: " + err.dump() + "\n\ndata: [DONE]\n\n"), true);
+            } else {
+                send_response(ModelLoadFailedResponse(model, refusal));
+            }
             return;
         }
 
