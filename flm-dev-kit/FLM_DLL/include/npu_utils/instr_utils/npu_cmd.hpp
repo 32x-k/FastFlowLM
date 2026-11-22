@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <stdio.h>
+#include <climits>
 #include "buffer.hpp"
 #include "utils/debug_utils.hpp"
 
@@ -126,6 +127,7 @@ struct npu_cmd{
 #include <cstdint>
 #include <cstdlib>
 #include <stdio.h>
+#include <climits>
 #include "buffer.hpp"
 #include "utils/debug_utils.hpp"
 #include "xrt/xrt_bo.h"

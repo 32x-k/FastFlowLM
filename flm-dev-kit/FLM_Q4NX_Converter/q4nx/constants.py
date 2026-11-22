@@ -37,12 +37,14 @@ class ModelArch(IntEnum):
     DFLASH = auto()
     QWEN38_DFLASH2 = auto()
     QWEN3_ASR = auto()
+    PLAMO3 = auto()
 
 
 ModelArchNames: dict[ModelArch, list[str]] = {
     # Confucius4-R2T2 (Qwen3-ASR): Youdao's GGUF reports architecture qwen3vl and a meaningless general.name, so select it
     # with -f qwen3-asr. It must stay ahead of the "qwen3" entries: -f matching is by prefix.
     ModelArch.QWEN3_ASR: ["qwen3-asr", "qwen3asr", "confucius4-r2t2", "r2t2"],
+    ModelArch.PLAMO3: ["plamo3", "plamo-3"],
     # Qwen3.8 reports general.architecture = "qwen35", so it is recognised by
     # general.basename ("Qwen3.8") instead -- keep it ahead of the "qwen3" entry,
     # which "qwen3.8" also prefix-matches.
@@ -116,4 +118,5 @@ ModelArchConfigs: dict[ModelArch, str] = {
     ModelArch.DFLASH: "dflash.json",
     ModelArch.QWEN38_DFLASH2: "qwen3.8_dflash2.json",
     ModelArch.QWEN3_ASR: "qwen3_asr.json",
+    ModelArch.PLAMO3: "plamo3.json",
 }

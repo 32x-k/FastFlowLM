@@ -9,6 +9,7 @@
 #include "AutoModel/flm_backend.hpp"
 #include "AutoModel/model_backend.hpp"
 #include "models/gemma/flm/aie2p/gemma_npu.hpp"
+#include "models/plamo3/flm/aie2p/plamo3_npu.hpp"
 #include "models/gemma4_12b/flm/aie2p/gemma4_12b_npu.hpp"
 #include "models/gemma4e/flm/aie2p/gemma4e_npu.hpp"
 #include "models/gemma4e_dflash/flm/aie2p/gemma4e_dflash.hpp"
@@ -84,6 +85,7 @@ void register_builtin_backends(BackendRegistry& registry) {
     RegisterFlm<qwen3_8mtp_npu>(registry, "qwen3.8-dflash2");   // the same engine; the draft package turns the DFlash2 drafter on
     RegisterFlm<qwen3_asr_npu>(registry, "r2t2");
     RegisterFlm<gemma_npu>(registry, "gemma3");
+    RegisterFlm<plamo3_npu>(registry, "plamo3");
     RegisterFlm<gemma_text_npu>(registry, "gemma3-text");
     RegisterFlm<gemma4e_npu>(registry, "gemma4e");
     RegisterFlm<gemma4e_flash>(registry, "gemma4e-flash");

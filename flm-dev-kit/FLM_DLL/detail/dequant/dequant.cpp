@@ -73,29 +73,79 @@ void Dequant::Impl::generate_dequant_q80_packed_in_q4nx_seq(npu_sequence* seq_pt
             uint32_t bd_offset = (i % 2) * 8;
             uint32_t round_offset = i * 8 + col;
             if(round_offset < total_column_rounds){
-                seq.npu_dma_memcpy_nd(
-                    sizeof(char),
-                    qw_in_arg_idx,
-                    MM2S,
-                    IT[col],
-                    (npu_bd_id)(0+bd_offset),
-                    it_channel_0,
-                    {0, 0, 0, input_offset},
-                    //NOTE: this for now only work if desired_m_dequant == quant_block_col_stride*m_tile_q4
-                    {
-                        blocks_per_row,
-                        (desired_m_dequant / m_tile_q4) / quant_block_col_stride,
-                        quant_block_col_stride * block_size_in_byte_q4_1 / 512,
-                        512
-                    },
-                    {
-                        quant_block_col_stride * block_size_in_byte_q4_1,
-                        quant_block_col_stride * block_size_in_byte_q4_1 * blocks_per_row,
-                        512,
-                        1
-                    },
-                    -1 ,0, false
-                );
+                if (blocks_per_row <= 63) {
+                    seq.npu_dma_memcpy_nd(
+                        sizeof(char),
+                        qw_in_arg_idx,
+                        MM2S,
+                        IT[col],
+                        (npu_bd_id)(0+bd_offset),
+                        it_channel_0,
+                        {0, 0, 0, input_offset},
+                        //NOTE: this for now only work if desired_m_dequant == quant_block_col_stride*m_tile_q4
+                        {
+                            blocks_per_row,
+                            (desired_m_dequant / m_tile_q4) / quant_block_col_stride,
+                            quant_block_col_stride * block_size_in_byte_q4_1 / 512,
+                            512
+                        },
+                        {
+                            quant_block_col_stride * block_size_in_byte_q4_1,
+                            quant_block_col_stride * block_size_in_byte_q4_1 * blocks_per_row,
+                            512,
+                            1
+                        },
+                        -1 ,0, false
+                    );
+                } else {
+                    const uint32_t half_blocks = blocks_per_row / 2;
+                    const uint32_t rem_blocks = blocks_per_row - half_blocks;
+                    const uint32_t stride_k = quant_block_col_stride * block_size_in_byte_q4_1;
+                    seq.npu_dma_memcpy_nd(
+                        sizeof(char),
+                        qw_in_arg_idx,
+                        MM2S,
+                        IT[col],
+                        (npu_bd_id)(0+bd_offset),
+                        it_channel_0,
+                        {0, 0, 0, input_offset},
+                        {
+                            half_blocks,
+                            (desired_m_dequant / m_tile_q4) / quant_block_col_stride,
+                            stride_k / 512,
+                            512
+                        },
+                        {
+                            stride_k,
+                            stride_k * blocks_per_row,
+                            512,
+                            1
+                        },
+                        -1 ,0, false
+                    );
+                    seq.npu_dma_memcpy_nd(
+                        sizeof(char),
+                        qw_in_arg_idx,
+                        MM2S,
+                        IT[col],
+                        (npu_bd_id)(2+bd_offset),
+                        it_channel_0,
+                        {0, 0, 0, input_offset + half_blocks * stride_k},
+                        {
+                            rem_blocks,
+                            (desired_m_dequant / m_tile_q4) / quant_block_col_stride,
+                            stride_k / 512,
+                            512
+                        },
+                        {
+                            stride_k,
+                            stride_k * blocks_per_row,
+                            512,
+                            1
+                        },
+                        -1 ,0, false
+                    );
+                }
 
                 if(output_mode == dequant_output_mode_t::NORMAL_DEQUANT){
                     std::cout << "Use normal output!" << std::endl;
@@ -219,29 +269,79 @@ void Dequant::Impl::generate_dequant_q4_1_seq(npu_sequence* seq_ptr, const u32 D
             uint32_t round_offset = i * 8 + col;
             if(round_offset < total_column_rounds){
 
-                seq.npu_dma_memcpy_nd(
-                    sizeof(char),
-                    qw_in_arg_idx,
-                    MM2S,
-                    IT[col],
-                    (npu_bd_id)(0+bd_offset),
-                    it_channel_0,
-                    {0, 0, 0, input_offset},
-                    //NOTE: this for now only work if desired_m_dequant == quant_block_col_stride*m_tile_q4
-                    {
-                        blocks_per_row,
-                        (desired_m_dequant / m_tile_q4) / quant_block_col_stride,
-                        quant_block_col_stride * block_size_in_byte_q4_1 / 512,
-                        512
-                    },
-                    {
-                        quant_block_col_stride * block_size_in_byte_q4_1,
-                        quant_block_col_stride * block_size_in_byte_q4_1 * blocks_per_row,
-                        512,
-                        1
-                    },
-                    -1 ,0, false
-                );
+                if (blocks_per_row <= 63) {
+                    seq.npu_dma_memcpy_nd(
+                        sizeof(char),
+                        qw_in_arg_idx,
+                        MM2S,
+                        IT[col],
+                        (npu_bd_id)(0+bd_offset),
+                        it_channel_0,
+                        {0, 0, 0, input_offset},
+                        //NOTE: this for now only work if desired_m_dequant == quant_block_col_stride*m_tile_q4
+                        {
+                            blocks_per_row,
+                            (desired_m_dequant / m_tile_q4) / quant_block_col_stride,
+                            quant_block_col_stride * block_size_in_byte_q4_1 / 512,
+                            512
+                        },
+                        {
+                            quant_block_col_stride * block_size_in_byte_q4_1,
+                            quant_block_col_stride * block_size_in_byte_q4_1 * blocks_per_row,
+                            512,
+                            1
+                        },
+                        -1 ,0, false
+                    );
+                } else {
+                    const uint32_t half_blocks = blocks_per_row / 2;
+                    const uint32_t rem_blocks = blocks_per_row - half_blocks;
+                    const uint32_t stride_k = quant_block_col_stride * block_size_in_byte_q4_1;
+                    seq.npu_dma_memcpy_nd(
+                        sizeof(char),
+                        qw_in_arg_idx,
+                        MM2S,
+                        IT[col],
+                        (npu_bd_id)(0+bd_offset),
+                        it_channel_0,
+                        {0, 0, 0, input_offset},
+                        {
+                            half_blocks,
+                            (desired_m_dequant / m_tile_q4) / quant_block_col_stride,
+                            stride_k / 512,
+                            512
+                        },
+                        {
+                            stride_k,
+                            stride_k * blocks_per_row,
+                            512,
+                            1
+                        },
+                        -1 ,0, false
+                    );
+                    seq.npu_dma_memcpy_nd(
+                        sizeof(char),
+                        qw_in_arg_idx,
+                        MM2S,
+                        IT[col],
+                        (npu_bd_id)(2+bd_offset),
+                        it_channel_0,
+                        {0, 0, 0, input_offset + half_blocks * stride_k},
+                        {
+                            rem_blocks,
+                            (desired_m_dequant / m_tile_q4) / quant_block_col_stride,
+                            stride_k / 512,
+                            512
+                        },
+                        {
+                            stride_k,
+                            stride_k * blocks_per_row,
+                            512,
+                            1
+                        },
+                        -1 ,0, false
+                    );
+                }
 
                 if(output_mode == dequant_output_mode_t::NORMAL_DEQUANT){
                     input_offset += quant_in_per_column;

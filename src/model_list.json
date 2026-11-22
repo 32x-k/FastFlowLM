@@ -1,6 +1,104 @@
 {
     "model_path": "models",
     "models": {
+        "plamo3-translate": {
+            "0.8b": {
+                "supported_platforms": [
+                    "aie2p"
+                ],
+                "name": "Plamo3-Translate-0.8B-NPU2",
+                "xclbin_folder": "Plamo3-Translate-0.8B-NPU2",
+                "url": "",
+                "file_url": "",
+                "size": 950000000,
+                "default_context_length": 8192,
+                "max_prefill_len": 2048,
+                "files": [
+                    "config.json",
+                    "model.q4nx",
+                    "tokenizer.jsonl"
+                ],
+                "vlm": false,
+                "asr": false,
+                "details": {
+                    "format": "NPU2",
+                    "family": "plamo3",
+                    "think": false,
+                    "parameter_size": "0.8B",
+                    "quantization_level": "Q4_K_M"
+                },
+                "label": [
+                    "translation",
+                    "single-turn"
+                ],
+                "footprint": 0.8,
+                "flm_min_version": "0.0.0"
+            },
+            "2b": {
+                "supported_platforms": [
+                    "aie2p"
+                ],
+                "name": "Plamo3-Translate-2B-NPU2",
+                "xclbin_folder": "Plamo3-Translate-2B-NPU2",
+                "url": "",
+                "file_url": "",
+                "size": 1800000000,
+                "default_context_length": 8192,
+                "max_prefill_len": 2048,
+                "files": [
+                    "config.json",
+                    "model.q4nx",
+                    "tokenizer.jsonl"
+                ],
+                "vlm": false,
+                "asr": false,
+                "details": {
+                    "format": "NPU2",
+                    "family": "plamo3",
+                    "think": false,
+                    "parameter_size": "2B",
+                    "quantization_level": "Q4_K_M"
+                },
+                "label": [
+                    "translation",
+                    "single-turn"
+                ],
+                "footprint": 1.8,
+                "flm_min_version": "0.0.0"
+            },
+            "8b": {
+                "supported_platforms": [
+                    "aie2p"
+                ],
+                "name": "Plamo3-Translate-8B-NPU2",
+                "xclbin_folder": "Plamo3-Translate-8B-NPU2",
+                "url": "",
+                "file_url": "",
+                "size": 5800000000,
+                "default_context_length": 8192,
+                "max_prefill_len": 2048,
+                "files": [
+                    "config.json",
+                    "model.q4nx",
+                    "tokenizer.jsonl"
+                ],
+                "vlm": false,
+                "asr": false,
+                "details": {
+                    "format": "NPU2",
+                    "family": "plamo3",
+                    "think": false,
+                    "parameter_size": "8B",
+                    "quantization_level": "Q4_K_M"
+                },
+                "label": [
+                    "translation",
+                    "single-turn"
+                ],
+                "footprint": 6.0,
+                "flm_min_version": "0.0.0"
+            }
+        },
         "hy-mt2-flash": {
             "1.8b": {
                 "supported_platforms": ["aie2p"],

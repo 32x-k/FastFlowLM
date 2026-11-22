@@ -616,6 +616,7 @@ list(APPEND FLM_ENGINE_LINK_LIBS
     qwen3_asr_npu
     gemma_npu
     gemma_text_npu
+    plamo3_npu
     gemma4e_npu
 )
 

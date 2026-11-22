@@ -13,6 +13,7 @@
 #include <mutex>
 #include "nlohmann/json.hpp"
 #include "tokenizers_cpp.h"
+#include "plamo3_tokenizer.hpp"
 #include "typedef.hpp"
 
 /// \brief Token struct
@@ -79,6 +80,8 @@ private:
     std::vector<uint8_t> byte_len_;           //!< per id, built on first use
     std::unordered_map<int, size_t> added_len_; //!< tokenizer.json "added_tokens": id -> bytes of the literal content
     std::unique_ptr<tokenizers::Tokenizer> tokenizer;
+    std::unique_ptr<Plamo3Tokenizer> plamo3;   //!< set when the model ships tokenizer.jsonl (PLaMo3)
+    bool is_plamo3 = false;
     std::unordered_map<uint32_t, uint8_t> inv_map;
 
     /// \brief Convert the cp1252 to utf8

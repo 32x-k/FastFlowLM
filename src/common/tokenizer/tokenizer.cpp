@@ -17,6 +17,12 @@
 /// \brief Constructor
 /// \param model_path the model path
 Tokenizer::Tokenizer(const std::string& model_path) {
+    if (Plamo3Tokenizer::exists(model_path)) {
+        this->plamo3 = std::make_unique<Plamo3Tokenizer>(model_path);
+        this->is_plamo3 = true;
+        this->is_doubled_encoded = false;
+        return;
+    }
     flm::file_access::ObserveOpen(
         std::filesystem::path(model_path) / "tokenizer.json");
     #ifdef _WIN32
@@ -165,6 +171,7 @@ std::string Tokenizer::cpt_to_utf8(const std::string& input) {
 /// \param text the text
 /// \return the encoded tokens
 std::vector<int> Tokenizer::encode(const std::string& text) {
+    if (this->is_plamo3) return this->plamo3->encode(text);
     return this->tokenizer->Encode(text);
 }
 
@@ -172,6 +179,11 @@ std::vector<int> Tokenizer::encode(const std::string& text) {
 /// \param tokens the tokens
 /// \return the decoded text
 std::string Tokenizer::decode(const std::vector<int>& tokens) {
+    if (this->is_plamo3) {
+        std::string out;
+        for (int id : tokens) out += this->run_time_decoder(id);
+        return out;
+    }
     return this->tokenizer->Decode(tokens);
 }
 
@@ -179,7 +191,16 @@ std::string Tokenizer::decode(const std::vector<int>& tokens) {
 /// \param answer_token the answer token
 /// \return the decoded text
 std::string Tokenizer::run_time_decoder(int answer_token) {
-    const std::string token = this->tokenizer->IdToToken(answer_token);
+    std::string token;
+    if (this->is_plamo3) {
+        token = this->plamo3->id_to_token(answer_token);
+        if (token.size() == 6 && token.compare(0, 3, "<0x") == 0 && token[5] == '>' &&
+            std::isxdigit(static_cast<unsigned char>(token[3])) && std::isxdigit(static_cast<unsigned char>(token[4]))) {
+            return std::string(1, static_cast<char>(std::stoi(token.substr(3, 2), nullptr, 16)));
+        }
+        return token;   // PLaMo3 pieces are literal UTF-8, no byte-level remap
+    }
+    token = this->tokenizer->IdToToken(answer_token);
     // SentencePiece byte fallback: "<0x0D>" stands for the byte 0x0D, not for that text
     if (!this->is_doubled_encoded && token.size() == 6 && token.compare(0, 3, "<0x") == 0 && token[5] == '>' &&
         std::isxdigit(static_cast<unsigned char>(token[3])) && std::isxdigit(static_cast<unsigned char>(token[4]))) {
@@ -190,6 +211,11 @@ std::string Tokenizer::run_time_decoder(int answer_token) {
 
 /// \brief Number of UTF-8 bytes of the text one token stands for
 size_t Tokenizer::token_byte_length(int id) {
+    if (this->is_plamo3) {
+        const std::string& tok = this->plamo3->id_to_token(id);
+        if (tok.size() == 6 && tok.compare(0, 3, "<0x") == 0) return 1;
+        return tok.size();
+    }
     std::call_once(byte_len_once_, [this]() {
         if (!this->is_doubled_encoded) throw std::runtime_error("token_byte_length needs a byte-level vocabulary");
         const auto inv = this->make_inverse_byte_map();

@@ -308,7 +308,9 @@ class chat_template {
                 }
             }
         } catch (const std::exception & e) {
-            fprintf(stderr, "Failed to generate tool call example: %s\n", e.what());
+            if (std::getenv("FLM_DEBUG_TEMPLATE")) {
+                fprintf(stderr, "Failed to generate tool call example: %s\n", e.what());
+            }
         }
     }
 

@@ -2822,6 +2822,20 @@ inline std::shared_ptr<Context> Context::builtins() {
   };
   globals.set("lower", char_transform_function("lower", ::tolower));
   globals.set("upper", char_transform_function("upper", ::toupper));
+  globals.set("replace", Value::callable([](const std::shared_ptr<Context> &, ArgumentsValue & args) {
+    args.expectArgs("replace", {3, 4}, {0, 0});
+    auto str = args.args[0].get<std::string>();
+    auto before = args.args[1].get<std::string>();
+    auto after = args.args[2].get<std::string>();
+    int64_t count = args.args.size() == 4 ? args.args[3].get<int64_t>() : static_cast<int64_t>(str.length());
+    if (before.empty()) return Value(str);
+    size_t start_pos = 0;
+    while ((start_pos = str.find(before, start_pos)) != std::string::npos && count-- > 0) {
+      str.replace(start_pos, before.length(), after);
+      start_pos += after.length();
+    }
+    return Value(str);
+  }));
   globals.set("default", Value::callable([=](const std::shared_ptr<Context> &, ArgumentsValue & args) {
     args.expectArgs("default", {2, 3}, {0, 1});
     auto & value = args.args[0];

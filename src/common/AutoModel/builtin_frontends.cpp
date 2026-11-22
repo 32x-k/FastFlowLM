@@ -4,6 +4,7 @@
 
 #include "AutoModel/modeling_gemma3.hpp"
 #include "AutoModel/modeling_gemma3_text.hpp"
+#include "AutoModel/modeling_plamo3.hpp"
 #include "AutoModel/modeling_gemma4_12b.hpp"
 #include "AutoModel/modeling_gemma4e.hpp"
 #include "AutoModel/modeling_gpt_oss.hpp"
@@ -79,6 +80,7 @@ void register_builtin_frontends(FrontendRegistry& registry) {
     Register<Qwen3_ASR>(registry, "r2t2");
     Register<Gemma3>(registry, "gemma3");
     Register<Gemma3_Text_Only>(registry, "gemma3-text");
+    Register<Plamo3_Translate>(registry, "plamo3");
     Register<Gemma4e>(registry, "gemma4e");
     Register<Gemma4e_Flash>(registry, "gemma4e-flash");
     Register<Gemma4e_DFlash>(registry, "gemma4e-dflash");
