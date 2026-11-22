@@ -222,6 +222,9 @@ public:
     void set_io_threads(size_t num_threads) { io_thread_count_ = num_threads; }
     void set_npu_queue_length(size_t q_len) { npu_request_coordinator_.set_capacity(q_len); }
     void set_idle_callback(std::chrono::seconds interval, std::function<bool()> should_run, std::function<void()> callback);
+    void set_npu_queued_callback(std::function<void(const std::string& requested_model)> callback) {
+        on_npu_queued_request_ = std::move(callback);
+    }
     // Maximum accepted HTTP request body size (in bytes)
     void set_max_body_size_bytes(std::size_t bytes) { max_body_size_bytes_ = bytes; }
     /// --cors-origins: comma-separated origins allowed besides the local ones; "*" allows all.
@@ -261,6 +264,7 @@ private:
     std::chrono::seconds idle_check_interval_{0};
     std::function<bool()> should_run_idle_check_;
     std::function<void()> on_idle_check_;
+    std::function<void(const std::string& requested_model)> on_npu_queued_request_;
     ///@brief routes
     std::map<std::string, RequestHandler> routes;
     ///@brief running

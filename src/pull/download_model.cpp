@@ -15,6 +15,7 @@
 #include <chrono>
 #include <mutex>
 #include "utils/utils.hpp"
+#include "utils/model_load_cancel.hpp"
 #include "nlohmann/json.hpp"
 #include "picosha2.h" 
 #include "sha1.hpp"
@@ -100,6 +101,9 @@ size_t write_data_to_string(void* ptr, size_t size, size_t nmemb, std::string* u
 /// \param ulnow the current upload size
 /// \return the progress
 int progress_callback(void* clientp, double dltotal, double dlnow, double ultotal, double ulnow) {
+    if (flm::is_model_load_cancelled()) {
+        return 1;
+    }
     if (dltotal > 0) {
         using Clock = std::chrono::steady_clock;
         static Clock::time_point last_print_time = Clock::now();

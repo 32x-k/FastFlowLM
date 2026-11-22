@@ -291,6 +291,12 @@ endif()
 
 
 add_executable(flm ${SOURCES} ${HEADERS})
+if(NOT WIN32)
+    # Export symbols from flm so Linux PLT hooks in model_load_cancel.cpp can
+    # cooperatively interrupt prebuilt NPU/Q4NX shared-library model loads.
+    set_target_properties(flm PROPERTIES ENABLE_EXPORTS ON)
+    target_link_libraries(flm PRIVATE ${CMAKE_DL_LIBS})
+endif()
 
 if(FLM_ENABLE_CORE)
     include("${CMAKE_SOURCE_DIR}/common/core/core_sources.cmake")

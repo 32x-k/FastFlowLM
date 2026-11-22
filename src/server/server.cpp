@@ -859,13 +859,47 @@ bool WebServer::handle_request(http::request<http::string_body>& req,
     auto* req_ptr = &req;
     auto* res_ptr = &res;
 
+    // Create cancellation token and begin monitoring client disconnects immediately,
+    // even while the request waits in the NPU queue.
+    auto cancellation_token = std::make_shared<CancellationToken>(session);
+    if (session) {
+        session->set_cancellation_token(cancellation_token);
+    }
+
+    // Extract requested model (if any) so a competing request arriving while another
+    // model is loading can cancel the in-progress load immediately.
+    std::string queued_model_hint;
+    if (needs_npu) {
+        const bool is_chat_route =
+            path == "/v1/completions" || path == "/v1/chat/completions" ||
+            path == "/api/generate" || path == "/api/chat";
+        if (!is_chat_route) {
+            queued_model_hint = "__other_npu_request__";
+        } else if (is_json && !req.body().empty()) {
+            try {
+                const auto parsed = json::parse(req.body());
+                if (parsed.is_object() && parsed.contains("model") && parsed["model"].is_string()) {
+                    queued_model_hint = parsed["model"].get<std::string>();
+                }
+            } catch (...) {
+                // Malformed JSON is handled inside process_task.
+            }
+        }
+    }
+
     // Define a task lambda with is_deferred flag
-    auto process_task = [this, it, req_ptr, res_ptr, session, needs_npu, key, path, is_json](bool is_deferred) {
+    auto process_task = [this, it, req_ptr, res_ptr, session, needs_npu, key, path, is_json, cancellation_token](bool is_deferred) {
         auto& req_ref = *req_ptr;
         auto& res_ref = *res_ptr;
         AcceleratorRequestCompletionGuard completion([this, needs_npu] {
             if (needs_npu) process_next_npu_request();
         });
+
+        if (cancellation_token->cancelled()) {
+            header_print("⏭️ ", "Skipping cancelled queued request: " + key);
+            cancellation_token->complete();
+            return;
+        }
 
         // Parse JSON request body
         json request_json;
@@ -887,14 +921,12 @@ bool WebServer::handle_request(http::request<http::string_body>& req,
                 {"code", 400}}} });
             res_ref.set(http::field::content_type, "application/json");
             res_ref.prepare_payload();
+            cancellation_token->complete();
 
             // Only write from callback when deferred
             if (is_deferred && session) session->write_response_from_callback();
             return;
         }
-
-        auto cancellation_token = std::make_shared<CancellationToken>(session);
-        session->set_cancellation_token(cancellation_token);
 
         std::string request_id;
         if (request_json.is_object() && request_json.contains("request_id") &&
@@ -1037,6 +1069,7 @@ bool WebServer::handle_request(http::request<http::string_body>& req,
     }
 
     if (admission == AcceleratorRequestCoordinator::Admission::queue_full) {
+        cancellation_token->complete();
         res.result(http::status::service_unavailable);
         res.body() = dump_error_body(json{
             {"error", "NPU is in use and request queue is full (limit: " +
@@ -1052,6 +1085,9 @@ bool WebServer::handle_request(http::request<http::string_body>& req,
     header_print("🕒 ", "Accelerator busy, request queued (" +
         std::to_string(npu_request_coordinator_.size()) + "/" +
         std::to_string(npu_request_coordinator_.capacity()) + "): " + key);
+    if (on_npu_queued_request_) {
+        on_npu_queued_request_(queued_model_hint);
+    }
     return true;
 }
 
@@ -1066,6 +1102,9 @@ std::unique_ptr<WebServer> create_lm_server(model_list& models, ModelDownloader&
     auto server = std::make_unique<WebServer>(args.host, args.port, args.cors);
     server->set_cors_origins(args.cors_origins);
     auto rest_handler = std::make_shared<RestHandler>(models, downloader, args, npu_device);
+    server->set_npu_queued_callback([rest_handler](const std::string& requested_model) {
+        rest_handler->cancel_load_if_different_model(requested_model);
+    });
     if (args.idle_unload_seconds > 0) {
         server->set_idle_callback(
             std::chrono::seconds(1),

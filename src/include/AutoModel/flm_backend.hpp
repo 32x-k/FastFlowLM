@@ -7,6 +7,7 @@
 
 #include "AutoModel/model_backend.hpp"
 #include "tensor_utils/q4_npu_eXpress.hpp"
+#include "utils/model_load_cancel.hpp"
 
 #include <memory>
 #include <stdexcept>
@@ -34,11 +35,15 @@ public:
 
         // Scoped: the packed weights are copied into the engine, and the
         // several hundred MB they occupy are freed before load_model returns.
+        flm::throw_if_model_load_cancelled();
         Q4NX q4nx(context.model_path);
+        flm::throw_if_model_load_cancelled();
         auto engine = std::make_unique<Engine>(
             *context.config, context.npu,
             static_cast<int>(context.context_length));
+        flm::throw_if_model_load_cancelled();
         engine->load_weights(q4nx);
+        flm::throw_if_model_load_cancelled();
         engine->clear_context();
         engine_ = std::move(engine);
     }

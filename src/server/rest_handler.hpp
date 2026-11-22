@@ -132,11 +132,17 @@ public:
     /// Caller must hold the accelerator lock (via WebServer idle maintenance).
     void unload_if_idle();
 
+    /// Immediately cancel an in-progress model load when a competing request arrives
+    /// for a different model (or a non-chat NPU workload).
+    bool cancel_load_if_different_model(const std::string& requested_model);
+
 private:
     void touch_activity();
     std::string effective_default_model() const;
     bool ensure_model_loaded(const std::string& model_tag,
-                             const std::string& request_backend = "", std::string* refusal = nullptr);
+                             const std::string& request_backend = "",
+                             std::string* refusal = nullptr,
+                             std::shared_ptr<CancellationToken> cancellation_token = nullptr);
     bool is_known_model(const std::string& model_tag);
     void ensure_asr_model_loaded(const std::string& model_tag);
     void ensure_embed_model_loaded(const std::string& model_tag);
@@ -193,4 +199,7 @@ private:
     int idle_unload_seconds = 0;
     std::atomic<int64_t> last_activity_ms_{0};
     std::atomic<bool> has_loaded_model_{false};
+    std::atomic<bool> loading_in_progress_{false};
+    std::string loading_model_tag_;
+    std::shared_ptr<CancellationToken> loading_token_;
 };

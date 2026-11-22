@@ -16,6 +16,7 @@
 #include "base64.hpp"
 #include "chat/positional_tool_results.hpp"
 #include "utils/log_privacy.hpp"
+#include "utils/model_load_cancel.hpp"
 #include <algorithm>
 #include <cctype>
 #include <cstring>
@@ -778,10 +779,52 @@ void RestHandler::unload_if_idle() {
     header_print("FLM", "Idle timeout reached (" << idle_unload_seconds << "s); unloaded model '" << unloaded_tag << "' from NPU/RAM.");
 }
 
+bool RestHandler::cancel_load_if_different_model(const std::string& requested_model) {
+    if (!loading_in_progress_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    std::string resolved = requested_model;
+    if (resolved.empty()) {
+        resolved = effective_default_model();
+    }
+    if (resolved != "model-faker" && resolved != "__other_npu_request__") {
+        resolved = supported_models.rectify_model_tag(resolved);
+    }
+
+    std::shared_ptr<CancellationToken> active_token;
+    std::string loading_tag;
+    {
+        std::lock_guard lock(model_info_mutex);
+        if (!loading_in_progress_.load(std::memory_order_relaxed) || loading_model_tag_.empty()) {
+            return false;
+        }
+        if (resolved == loading_model_tag_) {
+            return false;
+        }
+        loading_tag = loading_model_tag_;
+        active_token = loading_token_;
+    }
+
+    header_print("⚡ ", "Different request ('" << resolved << "') arrived while loading '"
+                                               << loading_tag << "'; cancelling active model load");
+    flm::request_model_load_cancel();
+    if (active_token) {
+        active_token->cancel();
+    }
+    return true;
+}
+
 ///@brief Ensure the model is loaded
 ///@param model_tag the model tag
 bool RestHandler::ensure_model_loaded(const std::string& model_tag,
-                                      const std::string& request_backend, std::string* refusal) {
+                                      const std::string& request_backend,
+                                      std::string* refusal,
+                                      std::shared_ptr<CancellationToken> cancellation_token) {
+    if (cancellation_token && cancellation_token->cancelled()) {
+        if (refusal) *refusal = "Request cancelled before model load";
+        return false;
+    }
+
     // Refuse a name the catalog does not have before anything resolves it;
     // an unknown name used to load a substitute model (and on dev04 could
     // end the process). Checked after rectify_model_tag, as get_model_info
@@ -802,10 +845,37 @@ bool RestHandler::ensure_model_loaded(const std::string& model_tag,
     }
 
     const auto& requested_backend = request_backend.empty() ? backend : request_backend;
+    std::string active_plan_tag;
+    struct LoadingStateGuard {
+        RestHandler* self;
+        bool armed = false;
+        ~LoadingStateGuard() {
+            if (!armed) return;
+            std::lock_guard lock(self->model_info_mutex);
+            self->loading_in_progress_.store(false, std::memory_order_release);
+            self->loading_model_tag_.clear();
+            self->loading_token_.reset();
+        }
+    } loading_guard{this};
+
     try {
         auto plan = resolve_model_load(supported_models.rectify_model_tag(model_tag), supported_models, requested_backend);
         if (auto_chat_engine && current_model_tag == plan.tag && loaded_selection.backend == plan.selection.backend &&
             loaded_selection.provider == plan.selection.provider) return true;
+
+        active_plan_tag = plan.tag;
+        // Bind the cancellation context BEFORE publishing loading_in_progress_=true so a
+        // competing request arriving concurrently can never have its cancel flag cleared.
+        flm::ScopedModelLoadCancelContext cancel_ctx(
+            cancellation_token ? &cancellation_token->is_cancelled : nullptr);
+        {
+            std::lock_guard lock(model_info_mutex);
+            loading_model_tag_ = plan.tag;
+            loading_token_ = cancellation_token;
+            loading_in_progress_.store(true, std::memory_order_release);
+            loading_guard.armed = true;
+        }
+        flm::throw_if_model_load_cancelled();
 
         auto* device = plan.prepare_device(npu_device_inst, power_mode);
         switch (downloader.is_model_downloaded(plan.tag, false, /*fast_check=*/true)) {
@@ -813,7 +883,11 @@ bool RestHandler::ensure_model_loaded(const std::string& model_tag,
                 break;
             case ModelDownloader::ModelStatus::Outdated:
             case ModelDownloader::ModelStatus::Missing:
-                if (!downloader.pull_model(plan.tag, modelscope)) throw std::runtime_error("failed to download " + plan.tag);
+                if (!downloader.pull_model(plan.tag, modelscope)) {
+                    flm::throw_if_model_load_cancelled();
+                    throw std::runtime_error("failed to download " + plan.tag);
+                }
+                flm::throw_if_model_load_cancelled();
                 // The pull can select a different catalog source. Preflight its actual entry.
                 plan = resolve_model_load(plan.tag, supported_models, requested_backend);
                 device = plan.prepare_device(npu_device_inst, power_mode);
@@ -821,6 +895,7 @@ bool RestHandler::ensure_model_loaded(const std::string& model_tag,
             case ModelDownloader::ModelStatus::Incompatible:
                 throw std::runtime_error(plan.tag + " is incompatible with this version of FastFlowLM");
         }
+        flm::throw_if_model_load_cancelled();
         const auto path = supported_models.get_load_path(plan.tag);
         const int chunk = prefill_chunk_len_arg != -1 ? prefill_chunk_len_arg : plan.info.at("max_prefill_len").get<int>();
 
@@ -833,12 +908,14 @@ bool RestHandler::ensure_model_loaded(const std::string& model_tag,
         has_loaded_model_.store(false, std::memory_order_relaxed);
         auto_chat_engine.reset();
         prompt_cache.reset();
+        flm::throw_if_model_load_cancelled();
         auto engine = flm::frontend::FrontendRegistry::instance().create(plan.family, device);
         engine->set_server_mode(true);
         engine->configure_parameter("img_pre_resize", img_pre_resize);
         engine->set_prefix_limits(prefix_cache_mb, prefix_slots, prefix_min_gain);
         const auto load_started = std::chrono::steady_clock::now();
         engine->load_model(path, plan.info, ctx_length, preemption, plan.selection.backend);
+        flm::throw_if_model_load_cancelled();
         engine->save_request_settings();
         report_load_time(load_started);
         prefill_chunk_len = chunk;
@@ -854,6 +931,18 @@ bool RestHandler::ensure_model_loaded(const std::string& model_tag,
         has_loaded_model_.store(true, std::memory_order_relaxed);
         touch_activity();
         return true;
+    } catch (const flm::ModelLoadCancelledError& e) {
+        {
+            std::lock_guard lock(model_info_mutex);
+            current_model_tag = "model-faker";
+            loaded_backend.clear();
+        }
+        has_loaded_model_.store(false, std::memory_order_relaxed);
+        auto_chat_engine.reset();
+        prompt_cache.reset();
+        if (refusal) *refusal = e.what();
+        header_print("🔴 ", "Model load cancelled for '" << (active_plan_tag.empty() ? model_tag : active_plan_tag)
+                                                         << "': " << e.what());
     } catch (const flm::backend::NpuUnavailable& e) {
         if (refusal) *refusal = flm::backend::kNoNpuDevice;
         header_print("ERROR", "Failed to load model: " + std::string(e.what()));
@@ -1194,7 +1283,7 @@ void RestHandler::handle_generate(const json& request,
         auto load_start_time = time_utils::now();
         // TODO: Use Another Check Function avoid loading again
         std::string refusal;
-        if (!ensure_model_loaded(model, request_backend, &refusal)) {
+        if (!ensure_model_loaded(model, request_backend, &refusal, cancellation_token)) {
             json error_response = {{"error", refusal.empty() ? "Failed to load " + model + " model!" : refusal}};
             send_response(error_response);
             return;
@@ -1329,7 +1418,7 @@ void RestHandler::handle_chat(const json& request,
 
         auto load_start_time = time_utils::now();
         std::string refusal;
-        if (!ensure_model_loaded(model, request_backend, &refusal)) {
+        if (!ensure_model_loaded(model, request_backend, &refusal, cancellation_token)) {
             json error_response = {{"error", refusal.empty() ? "Failed to load " + model + " model!" : refusal}};
             send_response(error_response);
             return;
@@ -1678,7 +1767,7 @@ void RestHandler::handle_openai_chat_completion(const json& request,
         }
         auto load_start_time = time_utils::now();
         std::string refusal;
-        if (!ensure_model_loaded(model, request_backend, &refusal)) {
+        if (!ensure_model_loaded(model, request_backend, &refusal, cancellation_token)) {
             send_response(ModelLoadFailedResponse(model, refusal));
             return;
         }
@@ -2237,7 +2326,7 @@ void RestHandler::handle_openai_completion(const json& request,
         int length_limit = value_or(request, "max_tokens", 4096);
 
         std::string refusal;
-        if (!ensure_model_loaded(model, request_backend, &refusal)) {
+        if (!ensure_model_loaded(model, request_backend, &refusal, cancellation_token)) {
             send_response(ModelLoadFailedResponse(model, refusal));
             return;
         }
