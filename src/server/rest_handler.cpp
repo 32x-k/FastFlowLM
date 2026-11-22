@@ -805,6 +805,20 @@ RestHandler::RestHandler(model_list& models, ModelDownloader& downloader, progra
         this->current_model_tag = "model-faker";
     }
     this->prompt_cache = PromptCache();
+
+    // Prewarm the first 50% of Plamo3-Translate-8B in the background so switching to 8B
+    // only needs to stream the second half while the first half loads from RAM.
+    try {
+        const std::string tag_8b = supported_models.rectify_model_tag("plamo3-translate:8b");
+        if (supported_models.is_model_supported(tag_8b) &&
+            downloader.is_model_downloaded(tag_8b, false, /*fast_check=*/true) == ModelDownloader::ModelStatus::Ready) {
+            const std::string path_8b = supported_models.get_load_path(tag_8b);
+            std::thread([path_8b]() {
+                flm::prewarm_half_model_weight_file(path_8b);
+            }).detach();
+        }
+    } catch (...) {
+    }
 }
 
 ///@brief RestHandler destructor
@@ -966,6 +980,14 @@ bool RestHandler::ensure_model_loaded(const std::string& model_tag,
         flm::throw_if_model_load_cancelled();
         const auto path = supported_models.get_load_path(plan.tag);
         const int chunk = prefill_chunk_len_arg != -1 ? prefill_chunk_len_arg : plan.info.at("max_prefill_len").get<int>();
+        const std::string previous_model_path =
+            (auto_chat_engine && current_model_tag != "model-faker")
+                ? supported_models.get_load_path(current_model_tag)
+                : std::string();
+
+        // Stream the second 50% of model.q4nx into page cache in parallel while the first 50%
+        // is being copied from RAM into XRT BOs.
+        flm::start_second_half_readahead(path);
 
         // From here on the two engines must not overlap in accelerator memory.
         {
@@ -986,6 +1008,11 @@ bool RestHandler::ensure_model_loaded(const std::string& model_tag,
         flm::throw_if_model_load_cancelled();
         engine->save_request_settings();
         report_load_time(load_started);
+        if (!previous_model_path.empty() && previous_model_path != path) {
+            std::thread([previous_model_path]() {
+                flm::trim_second_half_page_cache(previous_model_path);
+            }).detach();
+        }
         prefill_chunk_len = chunk;
         positional_tool_results = plan.info.value("positional_tool_results", false)
             && engine->backend_id() == flm::backend::kOgaHipepBackendId;
@@ -2393,7 +2420,19 @@ void RestHandler::handle_openai_completion(const json& request,
 
         int length_limit = value_or(request, "max_tokens", 4096);
         const bool is_connection_probe =
-            length_limit == 32 && prompt.find("Hi.\n") != std::string::npos;
+            length_limit == 32 &&
+            (prompt.find("<|plamo:msg|>Hi.<|plamo:tag|>") != std::string::npos ||
+             prompt.find("Hi.\n") != std::string::npos);
+
+        // Always ensure the requested model is actually loaded on the NPU before checking
+        // the completion LRU cache so switching models via a connection probe or translation
+        // request immediately loads the target model.
+        std::string refusal;
+        if (!ensure_model_loaded(model, request_backend, &refusal, cancellation_token)) {
+            send_response(ModelLoadFailedResponse(model, refusal));
+            return;
+        }
+
         const bool cache_eligible =
             !is_connection_probe &&
             value_or(request, "cache", true) &&
@@ -2448,12 +2487,6 @@ void RestHandler::handle_openai_completion(const json& request,
                 send_response(response);
                 return;
             }
-        }
-
-        std::string refusal;
-        if (!ensure_model_loaded(model, request_backend, &refusal, cancellation_token)) {
-            send_response(ModelLoadFailedResponse(model, refusal));
-            return;
         }
         // This shares the engine with /v1/chat/completions and replaces the
         // conversation in it, so the chat cache no longer describes it.

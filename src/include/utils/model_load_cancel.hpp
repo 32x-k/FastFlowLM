@@ -31,6 +31,18 @@ inline void throw_if_model_load_cancelled() {
     }
 }
 
+/// Prewarm and pin the first 50% of `<model_dir>/model.q4nx` in the OS page cache,
+/// and release the second 50% so at most half of a large model stays resident at rest.
+void prewarm_half_model_weight_file(const std::string& model_dir) noexcept;
+
+/// Spawn an asynchronous readahead worker for the second 50% of `<model_dir>/model.q4nx`
+/// so it streams into page cache in parallel while the first 50% is loaded into NPU BOs.
+void start_second_half_readahead(const std::string& model_dir) noexcept;
+
+/// Evict the second 50% of `<model_dir>/model.q4nx` (for files >= 4 GiB) from page cache
+/// after unloading/switching away, keeping the first 50% resident.
+void trim_second_half_page_cache(const std::string& model_dir) noexcept;
+
 /// RAII scope active for the duration of a single model download + NPU load.
 class ScopedModelLoadCancelContext {
 public:
