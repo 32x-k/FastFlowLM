@@ -177,6 +177,26 @@ void log_request_summary(const chat_meta_info_t& m, size_t kv_used, size_t kv_ma
     header_print("FLM", os.str());
 }
 
+bool is_model_disabled_by_env(const std::string& model_tag) {
+    const char* raw = std::getenv("FLM_DISABLED_MODELS");
+    if (!raw || raw[0] == '\0') return false;
+    std::string list(raw);
+    size_t start = 0;
+    while (start <= list.size()) {
+        size_t comma = list.find(',', start);
+        std::string item = list.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+        // trim ASCII whitespace
+        size_t a = item.find_first_not_of(" \t\r\n");
+        size_t b = item.find_last_not_of(" \t\r\n");
+        if (a != std::string::npos && b != std::string::npos) {
+            if (item.substr(a, b - a + 1) == model_tag) return true;
+        }
+        if (comma == std::string::npos) break;
+        start = comma + 1;
+    }
+    return false;
+}
+
 /// \brief Whether a request sets a field
 /// \note Some clients send null for every option they leave unset, so null
 ///       counts as not set; json::value() and conversions throw on it instead.
@@ -810,7 +830,8 @@ RestHandler::RestHandler(model_list& models, ModelDownloader& downloader, progra
     // only needs to stream the second half while the first half loads from RAM.
     try {
         const std::string tag_8b = supported_models.rectify_model_tag("plamo3-translate:8b");
-        if (supported_models.is_model_supported(tag_8b) &&
+        if (!is_model_disabled_by_env(tag_8b) &&
+            supported_models.is_model_supported(tag_8b) &&
             downloader.is_model_downloaded(tag_8b, false, /*fast_check=*/true) == ModelDownloader::ModelStatus::Ready) {
             const std::string path_8b = supported_models.get_load_path(tag_8b);
             std::thread([path_8b]() {
@@ -1052,8 +1073,10 @@ bool RestHandler::ensure_model_loaded(const std::string& model_tag,
 ///      catalog does not have with a 404 instead of a failed load.
 ///@param model_tag the model tag
 bool RestHandler::is_known_model(const std::string& model_tag) {
-    return model_tag == "model-faker" ||
-           supported_models.is_model_supported(supported_models.rectify_model_tag(model_tag));
+    if (model_tag == "model-faker") return true;
+    const std::string rectified = supported_models.rectify_model_tag(model_tag);
+    if (is_model_disabled_by_env(rectified)) return false;
+    return supported_models.is_model_supported(rectified);
 }
 
 ///@brief Ensure the asr model is loaded
@@ -1661,7 +1684,17 @@ void RestHandler::handle_models_openai(const json& request,
     std::function<void(const json&)> send_response,
     StreamResponseCallback send_streaming_response) {
     try {
-        send_response(supported_models.get_all_models_openai());
+        json payload = supported_models.get_all_models_openai();
+        if (payload.contains("data") && payload["data"].is_array()) {
+            json filtered = json::array();
+            for (const auto& item : payload["data"]) {
+                const std::string id = item.value("id", std::string());
+                if (!id.empty() && is_model_disabled_by_env(id)) continue;
+                filtered.push_back(item);
+            }
+            payload["data"] = std::move(filtered);
+        }
+        send_response(payload);
     }
     catch (const std::exception& e) {
         json error_response = { {"error", e.what()} };
