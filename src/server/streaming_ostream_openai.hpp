@@ -64,6 +64,8 @@ public:
 
     bool stopped_by_sequence() const { return stopped_; }
 
+    const std::string& emitted_text() const { return emitted_text_; }
+
 protected:
     ///@brief Called when buffer is full or flush is requested
     ///@param ch the character
@@ -216,6 +218,7 @@ private:
         
         // Send complete sequences if any
         if (!complete_content.empty()) {
+            emitted_text_ += complete_content;
             send_response(complete_content, is_final);
         }
         
@@ -317,6 +320,7 @@ private:
     size_t max_stop_len_ = 0;
     std::function<void()> on_stop_;
     bool stopped_ = false;
+    std::string emitted_text_;
 };
 
 ///@brief Custom ostream for streaming
@@ -338,6 +342,10 @@ public:
 
     bool stopped_by_sequence() const {
         return buf.stopped_by_sequence();
+    }
+
+    const std::string& emitted_text() const {
+        return buf.emitted_text();
     }
 
 private:

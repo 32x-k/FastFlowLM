@@ -30,11 +30,79 @@
 #include <chrono>
 #include <iomanip>
 #include <limits>
+#include <list>
 #include <locale>
+#include <mutex>
 #include <random>
+#include <unordered_map>
 #include "server.hpp"
 
 namespace {
+struct CachedCompletionEntry {
+    std::string text;
+    int prompt_tokens = 0;
+    int generated_tokens = 0;
+};
+
+class CompletionLruCache {
+public:
+    static constexpr size_t MAX_ENTRIES = 4096;
+
+    std::optional<CachedCompletionEntry> get(const std::string& key, int max_tokens) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = map_.find(key);
+        if (it == map_.end()) return std::nullopt;
+        if (it->second->second.generated_tokens > max_tokens) return std::nullopt;
+        items_.splice(items_.begin(), items_, it->second);
+        return it->second->second;
+    }
+
+    void put(const std::string& key, CachedCompletionEntry entry) {
+        if (entry.text.empty()) return;
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = map_.find(key);
+        if (it != map_.end()) {
+            it->second->second = std::move(entry);
+            items_.splice(items_.begin(), items_, it->second);
+            return;
+        }
+        if (items_.size() >= MAX_ENTRIES) {
+            auto last = std::prev(items_.end());
+            map_.erase(last->first);
+            items_.pop_back();
+        }
+        items_.emplace_front(key, std::move(entry));
+        map_[key] = items_.begin();
+    }
+
+private:
+    std::mutex mutex_;
+    std::list<std::pair<std::string, CachedCompletionEntry>> items_;
+    std::unordered_map<std::string, typename std::list<std::pair<std::string, CachedCompletionEntry>>::iterator> map_;
+};
+
+CompletionLruCache& global_completion_cache() {
+    static CompletionLruCache cache;
+    return cache;
+}
+
+std::string build_completion_cache_key(
+    const std::string& model,
+    const std::string& prompt,
+    const std::vector<std::string>& stops
+) {
+    std::string key;
+    key.reserve(model.size() + prompt.size() + 32);
+    key.append(model);
+    key.push_back('\x1f');
+    key.append(prompt);
+    for (const auto& s : stops) {
+        key.push_back('\x1e');
+        key.append(s);
+    }
+    return key;
+}
+
 json ModelErrorResponse(const ModelRequestError& error) {
     return {{"error", {{"message", error.what()},
                        {"type", error.type()},
@@ -2324,6 +2392,63 @@ void RestHandler::handle_openai_completion(const json& request,
         }
 
         int length_limit = value_or(request, "max_tokens", 4096);
+        const bool is_connection_probe =
+            length_limit == 32 && prompt.find("Hi.\n") != std::string::npos;
+        const bool cache_eligible =
+            !is_connection_probe &&
+            value_or(request, "cache", true) &&
+            !value_or(request, "ignore_eos", false) &&
+            value_or(request, "temperature", 0.0f) <= 0.01f &&
+            value_or(request, "n", 1) <= 1;
+        const std::string cache_key =
+            cache_eligible ? build_completion_cache_key(model, prompt, stop_sequences) : std::string();
+
+        if (cache_eligible) {
+            if (auto cached = global_completion_cache().get(cache_key, length_limit)) {
+                header_print("FLM", "Completion LRU cache hit (" + model + ", " + std::to_string(cached->text.size()) + " bytes)");
+                chat_meta_info_t cached_meta;
+                cached_meta.stop_reason = stop_reason_t::EOT_DETECTED;
+                cached_meta.prompt_tokens = cached->prompt_tokens;
+                cached_meta.generated_tokens = cached->generated_tokens;
+                if (stream) {
+                    auto openai_stream_callback = [&send_streaming_response](const std::string& data, bool is_final) {
+                        json data_json = data;
+                        send_streaming_response(data_json, is_final);
+                    };
+                    streaming_ostream_openai ostream(
+                        model,
+                        openai_stream_callback,
+                        stream_include_usage(request),
+                        {});
+                    ostream << cached->text;
+                    ostream.flush();
+                    ostream.finalize(cached_meta);
+                    return;
+                }
+                json response = {
+                    {"id", "fastflowlm-chat-completion"},
+                    {"object", "text_completion"},
+                    {"created", (int)std::time(nullptr)},
+                    {"model", model},
+                    {"choices", json::array({
+                        {
+                            {"text", cached->text},
+                            {"index", 0},
+                            {"logprobs", nullptr},
+                            {"finish_reason", "stop"}
+                        }
+                    })},
+                    {"usage", {
+                        {"prompt_tokens", cached_meta.prompt_tokens},
+                        {"prompt_tokens_details", {{"cached_tokens", cached_meta.prompt_tokens}}},
+                        {"completion_tokens", cached_meta.generated_tokens},
+                        {"total_tokens", cached_meta.prompt_tokens + cached_meta.generated_tokens}
+                    }}
+                };
+                send_response(response);
+                return;
+            }
+        }
 
         std::string refusal;
         if (!ensure_model_loaded(model, request_backend, &refusal, cancellation_token)) {
@@ -2413,6 +2538,17 @@ void RestHandler::handle_openai_completion(const json& request,
                 header_print("ERROR", std::string("Finishing the stream failed: ") + e.what());
                 send_stream_error(OpenAIExceptionResponse(e));
             }
+            if (cache_eligible &&
+                meta_info.stop_reason == stop_reason_t::EOT_DETECTED &&
+                !(cancellation_token && cancellation_token->cancelled()) &&
+                !ostream.emitted_text().empty()) {
+                global_completion_cache().put(
+                    cache_key,
+                    CachedCompletionEntry{
+                        ostream.emitted_text(),
+                        meta_info.prompt_tokens,
+                        meta_info.generated_tokens});
+            }
             log_request_summary(meta_info, this->auto_chat_engine->get_current_context_length(), this->auto_chat_engine->get_max_length());
 
             this->auto_chat_engine->clear_context();
@@ -2488,6 +2624,17 @@ void RestHandler::handle_openai_completion(const json& request,
             ostream.flush();
             if (stop_triggered.load(std::memory_order_relaxed) && meta_info.stop_reason == stop_reason_t::CANCEL_DETECTED) {
                 meta_info.stop_reason = stop_reason_t::EOT_DETECTED;
+            }
+            if (cache_eligible &&
+                meta_info.stop_reason == stop_reason_t::EOT_DETECTED &&
+                !(cancellation_token && cancellation_token->cancelled()) &&
+                !response_text.empty()) {
+                global_completion_cache().put(
+                    cache_key,
+                    CachedCompletionEntry{
+                        response_text,
+                        meta_info.prompt_tokens,
+                        meta_info.generated_tokens});
             }
 
             json response = {
